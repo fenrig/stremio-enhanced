@@ -16,6 +16,7 @@ class StreamingServer {
     // Use config directory instead of executable directory for cross-platform compatibility (especially AppImage)
     private static streamingServerDir = join(Properties.enhancedPath, "streamingserver");
     private static serverScriptPath = join(this.streamingServerDir, "server.js");
+    private static ffmpegWrapperPath = join(this.streamingServerDir, "ffmpeg-wrapper");
     private static logFilePath = join(Properties.enhancedPath, "stremio-server.log");
 
     private static getFFmpegUrl(): string {
@@ -67,8 +68,8 @@ class StreamingServer {
         return null;
     }
 
-    // Get the best available ffmpeg path (prefer system, fallback to downloaded)
-    private static getFFmpegPath(): string {
+    // Get the real FFmpeg binary (prefer system, fallback to downloaded)
+    private static getRealFFmpegPath(): string {
         // First, try system ffmpeg
         const systemFFmpeg = this.getSystemBinaryPath("ffmpeg");
         if (systemFFmpeg) {
@@ -80,6 +81,85 @@ class StreamingServer {
             ? join(this.streamingServerDir, "ffmpeg.exe")
             : join(this.streamingServerDir, "ffmpeg");
         return downloadedPath;
+    }
+
+    // The Stremio server's Linux NVIDIA probe currently emits a few FFmpeg
+    // arguments which are rejected by modern FFmpeg builds. Keep the real
+    // binary intact and put a small compatibility wrapper in front of it.
+    private static getFFmpegPath(): string {
+        if (process.platform === "linux" && existsSync(this.ffmpegWrapperPath)) {
+            return this.ffmpegWrapperPath;
+        }
+        return this.getRealFFmpegPath();
+    }
+
+    private static installLinuxFFmpegWrapper(realFFmpegPath: string): void {
+        if (process.platform !== "linux") return;
+
+        const wrapper = `#!/usr/bin/env bash
+set -u
+
+real_ffmpeg=\"$STREMIO_REAL_FFMPEG\"
+log_file=\"\${STREMIO_FFMPEG_WRAPPER_LOG:-/tmp/stremio-enhanced-ffmpeg-wrapper.log}\"
+args=(\"$@\")
+fixed_args=()
+modified=0
+test_command=0
+
+for arg in \"\${args[@]}\"; do
+    if [[ \"$arg\" == *\"samples/hevc.mkv\"* ]]; then
+        test_command=1
+        break
+    fi
+done
+
+i=0
+while (( i < \${#args[@]} )); do
+    arg=\"\${args[$i]}\"
+
+    # hls-converter passes an invalid CUDA device name to FFmpeg.
+    if [[ \"$arg\" == \"-filter_hw_device\" || \"$arg\" == \"-look_ahead\" ]]; then
+        modified=1
+        ((i += 2))
+        continue
+    fi
+
+    # The hardware probe can generate an invalid scale_cuda filter. Remove
+    # only this filter from the probe command; valid playback filters pass
+    # through unchanged.
+    if (( test_command )) && [[ \"$arg\" == \"-vf\" ]] && (( i + 1 < \${#args[@]} )); then
+        filter=\"\${args[$((i + 1))]}\"
+        fixed_filter=\"\$(printf '%s' \"$filter\" | sed -E 's/(^|,)scale_cuda(=[^,]*)?(,|$)/\\1/g; s/,,/,/g; s/^,//; s/,$//')\"
+        if [[ \"$fixed_filter\" != \"$filter\" ]]; then
+            modified=1
+        fi
+        if [[ -n \"$fixed_filter\" ]]; then
+            fixed_args+=(\"-vf\" \"$fixed_filter\")
+        else
+            modified=1
+        fi
+        ((i += 2))
+        continue
+    fi
+
+    fixed_args+=(\"$arg\")
+    ((i += 1))
+done
+
+if (( modified )); then
+    {
+        printf '%s\\n' '--- corrected FFmpeg invocation ---'
+        printf 'original: '; printf '%q ' \"\${args[@]}\"; printf '\\n'
+        printf 'corrected: '; printf '%q ' \"\${fixed_args[@]}\"; printf '\\n'
+    } >> \"$log_file\"
+fi
+
+exec \"$real_ffmpeg\" \"\${fixed_args[@]}\"
+`;
+
+        writeFileSync(this.ffmpegWrapperPath, wrapper, { encoding: "utf8", mode: 0o755 });
+        chmodSync(this.ffmpegWrapperPath, 0o755);
+        this.logger.info(`Installed Linux FFmpeg compatibility wrapper for ${realFFmpegPath}.`);
     }
 
     // Get the best available ffprobe path (prefer system, fallback to downloaded)
@@ -308,6 +388,10 @@ class StreamingServer {
                 }
             }
 
+            if (process.platform === "linux") {
+                this.installLinuxFFmpegWrapper(this.getRealFFmpegPath());
+            }
+
             this.logger.info("All streaming server files are ready.");
             return "ready";
 
@@ -434,6 +518,7 @@ class StreamingServer {
         }
 
         const ffmpegPath = this.getFFmpegPath();
+        const realFFmpegPath = this.getRealFFmpegPath();
         const ffprobePath = this.getFFprobePath();
 
         if (!existsSync(ffmpegPath)) {
@@ -456,6 +541,8 @@ class StreamingServer {
                     ...process.env,
                     FFMPEG_BIN: ffmpegPath,
                     FFPROBE_BIN: ffprobePath,
+                    STREMIO_REAL_FFMPEG: realFFmpegPath,
+                    STREMIO_FFMPEG_WRAPPER_LOG: join(this.streamingServerDir, "ffmpeg-wrapper.log"),
                 },
             });
 
