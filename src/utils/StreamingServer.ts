@@ -1,12 +1,12 @@
 import { fork, execSync } from "child_process";
 import * as unzipper from "unzipper";
-import { createWriteStream, existsSync, mkdirSync, chmodSync, unlinkSync, readFileSync, writeFileSync } from "fs";
+import { createWriteStream, existsSync, mkdirSync, chmodSync, unlinkSync, renameSync, readFileSync, writeFileSync } from "fs";
 import { join } from "path";
 import { getLogger } from "./logger";
 import Properties from "../core/Properties";
 import https from "https";
 import { shell } from "electron";
-import { FFMPEG_URLS, MACOS_FFPROBE_URLS } from "../constants";
+import { FFMPEG_URLS, MACOS_FFPROBE_URLS, SERVER_JS_URL } from "../constants";
 import Helpers from "./Helpers";
 
 class StreamingServer {
@@ -135,6 +135,35 @@ class StreamingServer {
         });
     }
 
+    // Download server.js atomically so an interrupted download cannot leave a
+    // partially written server script that appears usable on the next launch.
+    public static async downloadServerJs(url: string, version?: string): Promise<boolean> {
+        const temporaryPath = `${this.serverScriptPath}.download`;
+
+        try {
+            if (!existsSync(this.streamingServerDir)) {
+                mkdirSync(this.streamingServerDir, { recursive: true });
+            }
+
+            this.logger.info(`Downloading server.js from ${url}...`);
+            await this.downloadFile(url, temporaryPath);
+            renameSync(temporaryPath, this.serverScriptPath);
+
+            if (version) {
+                writeFileSync(join(this.streamingServerDir, "version.txt"), version, "utf8");
+            }
+
+            this.logger.info(`server.js downloaded successfully${version ? ` (${version})` : ""}.`);
+            return true;
+        } catch (error) {
+            this.logger.error(`Failed to download server.js: ${error}`);
+            if (existsSync(temporaryPath)) {
+                try { unlinkSync(temporaryPath); } catch {}
+            }
+            return false;
+        }
+    }
+
     private static async downloadAndExtractFFmpeg(): Promise<boolean> {
         const archiveUrl = this.getFFmpegUrl();
         const archivePath = join(this.streamingServerDir, (process.platform == "win32" || process.platform == "darwin") ? "ffmpeg-release.zip" : "ffmpeg-release.tar.xz");
@@ -240,10 +269,17 @@ class StreamingServer {
                 mkdirSync(this.streamingServerDir, { recursive: true });
             }
 
-            // Check if server.js exists (user must download manually)
+            // server.js is downloaded automatically by checkServerJsUpdate().
+            // Keep this status for the manual fallback if that download failed.
             if (!existsSync(this.serverScriptPath)) {
-                this.logger.warn("server.js not found. User needs to download it manually.");
-                return "missing_server_js";
+                const fallbackUrl = this.latestServerJsUrl || SERVER_JS_URL;
+                this.logger.info(`Retrying automatic server.js download from ${fallbackUrl}...`);
+                if (await this.downloadServerJs(fallbackUrl)) {
+                    // Continue into the FFmpeg checks below after a successful fallback download.
+                } else {
+                    this.logger.warn("server.js not found after automatic download attempts.");
+                    return "missing_server_js";
+                }
             }
 
             // Check if we need to download ffmpeg/ffprobe
@@ -355,9 +391,16 @@ class StreamingServer {
             this.latestServerJsUrl = downloadUrl;
 
             const isMissing = !existsSync(this.serverScriptPath);
-            const promptMessage = isMissing 
-                ? `The local streaming server (server.js) version ${latestVersion} is required to play videos. Do you want to download and install it now?`
-                : `A new version of the Stremio local server (${latestVersion}) is available. Do you want to update it now?`;
+
+            if (isMissing) {
+                const downloaded = await this.downloadServerJs(downloadUrl, latestVersion);
+                if (!downloaded) {
+                    this.logger.warn("Automatic server.js download failed; manual setup will be offered.");
+                }
+                return;
+            }
+
+            const promptMessage = `A new version of the Stremio local server (${latestVersion}) is available. Do you want to update it now?`;
 
             const response = await Helpers.showAlert(
                 "question",
@@ -367,20 +410,7 @@ class StreamingServer {
             );
             
             if (response === 0) { // Yes
-                if (!isMissing) {
-                    this.logger.info(`Deleting old server.js to trigger update to ${latestVersion}...`);
-                    if (existsSync(this.serverScriptPath)) {
-                        unlinkSync(this.serverScriptPath);
-                    }
-                    if (existsSync(currentVersionPath)) {
-                        unlinkSync(currentVersionPath);
-                    }
-                }
-                // Write the new version to version.txt so that when they manually download it, the version is tracked
-                if (!existsSync(this.streamingServerDir)) {
-                    mkdirSync(this.streamingServerDir, { recursive: true });
-                }
-                writeFileSync(currentVersionPath, latestVersion, "utf8");
+                await this.downloadServerJs(downloadUrl, latestVersion);
                 
             } else if (response === 2) { // No and don't ask again
                 writeFileSync(skipVersionPath, latestVersion, "utf8");

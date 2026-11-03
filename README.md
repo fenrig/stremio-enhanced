@@ -102,6 +102,14 @@ winget install Stremio.StremioService
     - For macOS (x86): `npm run build:mac:x64`
     - For macOS (arm64): `npm run build:mac:arm64`
 
+### NVIDIA hardware decoding on Linux
+
+NVIDIA video acceleration is detected automatically on Linux. This requires the proprietary NVIDIA driver and the `nvidia-vaapi-driver`/`libva-nvidia-driver` package provided by your distribution. You can verify the driver independently with `vainfo` before launching Stremio Enhanced.
+
+The default **Auto** mode enables NVIDIA acceleration only when an NVIDIA card is the primary DRM GPU and a common `nvidia_drv_video.so` VA-API driver is present. On hybrid AMD/Intel+NVIDIA systems where AMD or Intel is primary, Auto keeps the normal fallback path.
+
+The local `server.js` streaming component is downloaded automatically on first launch. If that fails, the app provides a manual download fallback.
+
 ## 🎨 Themes and Plugins
 
 ### 🖌️ Installing Themes

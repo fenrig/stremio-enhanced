@@ -282,7 +282,7 @@ async function useServerJS() {
             const result = await Helpers.showAlert(
                 "info",
                 "Streaming Server Setup Required",
-                `To enable video playback, you need to download the Stremio streaming server file (server.js).\n\n` +
+                `The automatic server.js download failed. To enable video playback, download the Stremio streaming server file manually.\n\n` +
                 `1. Download server.js from:\n${downloadUrl}\n\n` +
                 `2. Right click the page and select "Save As" and save it as "server.js".\n\n` +
                 `3. Place it in:\n${serverDir}\n\n` +
